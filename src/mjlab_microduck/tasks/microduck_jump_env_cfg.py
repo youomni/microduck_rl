@@ -60,7 +60,7 @@ from mjlab_microduck.robot.microduck_constants import MICRODUCK_STANDUP_ROBOT_CF
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.microduck_velocity_env_cfg import HEAD_BODY_NAMES
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
-from mjlab_microduck.tasks.runner import MicroduckOnPolicyRunner
+from mjlab_microduck.runner import MicroduckOnPolicyRunner
 from mjlab_microduck.tasks import register_mjlab_task
 
 
@@ -372,7 +372,7 @@ MicroduckJumpRlCfg = RslRlOnPolicyRunnerCfg(
     max_iterations=1500,
 )
 
-# Self-registration on import
+# Self-register task on import
 register_mjlab_task(
     task_id="Mjlab-Jump-Flat-MicroDuck",
     env_cfg=make_microduck_jump_env_cfg(),
