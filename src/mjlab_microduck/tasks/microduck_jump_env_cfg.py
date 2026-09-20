@@ -1,16 +1,35 @@
 """Microduck jump-with-rotation task.
 
 Episodic dynamic-jump policy: robot launches upward and rotates in place
-(yaw twist) before landing back on its feet. Isolated task file.
+(yaw twist) before landing back on its feet.
+
+Rebuilt on the real mjlab_microduck pattern — mjlab 1.3.0 has no configclass
+Cfg-subclassing API (the earlier version of this file assumed one and didn't
+import). Every task in this project is a plain `make_X_env_cfg(play) -> cfg`
+function that starts from `make_velocity_env_cfg()` and mutates the returned
+dict-based cfg, exactly like microduck_roulade_env_cfg.py / _sitstand_.
+
+STATUS: first-pass port of the original design intent (encourage vertical
+launch via com_upward_velocity, rotate via the twist command's heading
+field, keep foot-clearance/stability shaping, gentle action smoothing) onto
+the real API. It imports and registers, but — like roulade's "attempt 3,
+run 2" — the reward weights below are a starting point, not a tuned recipe.
+Expect to iterate once you see early training behavior (e.g. whether
+com_upward_velocity's max_height/max_vz actually rewards a clean launch
+instead of repeated bouncing, and whether the heading-rotation reward needs
+its own dedicated term rather than relying on track_angular_velocity, which
+this file currently drops).
 """
 
 import math
 from copy import deepcopy
 import torch
 
+# Symmetry: a yaw rotation is NOT left/right symmetric (spinning one way vs
+# the other are different maneuvers) — same reasoning as microduck_spin.
 ENABLE_SYMMETRY = False
 
-# Domain randomization
+# ── Domain randomisation (matched to roulade/velocity for sim2real parity) ───
 ENABLE_COM_RANDOMIZATION             = True
 ENABLE_HEAD_COM_RANDOMIZATION        = True
 ENABLE_KP_RANDOMIZATION              = False
@@ -18,7 +37,7 @@ ENABLE_KD_RANDOMIZATION              = False
 ENABLE_MASS_INERTIA_RANDOMIZATION    = True
 ENABLE_JOINT_FRICTION_RANDOMIZATION  = True
 ENABLE_ARMATURE_RANDOMIZATION        = True
-ENABLE_VELOCITY_PUSHES               = False
+ENABLE_VELOCITY_PUSHES               = False  # a push mid-jump is incoherent (roulade's reasoning)
 ENABLE_IMU_ORIENTATION_RANDOMIZATION = True
 ENABLE_ENCODER_BIAS                  = True
 
@@ -28,12 +47,19 @@ MASS_INERTIA_RANDOMIZATION_RANGE    = (0.95, 1.05)
 ARMATURE_RANDOMIZATION_RANGE        = (0.9, 1.1)
 JOINT_FRICTION_RANDOMIZATION_RANGE  = (0.9, 1.1)
 ENCODER_BIAS_RANGE                  = (-0.015, 0.015)
-KP_RANDOMIZATION_RANGE              = (0.85, 1.15)
-KD_RANDOMIZATION_RANGE              = (0.9, 1.1)
+KP_RANDOMIZATION_RANGE              = (0.85, 1.15)  # unused (kp DR off)
+KD_RANDOMIZATION_RANGE              = (0.9, 1.1)    # unused (kd DR off)
 IMU_ORIENTATION_RANDOMIZATION_ANGLE = 6.0
 
 EPISODE_LENGTH_S = 4.0
+
+# Measured standing trunk height (same value used by sitstand/roulade — don't
+# guess this, re-verify in sim if the robot/keyframe changes).
 STAND_Z = 0.115
+
+# In-place rotation target, ported from the original design intent (0-90°
+# per episode). This is a field on the shared twist/velocity command, not a
+# standalone command class — see the command section below.
 JUMP_HEADING_RANGE = (0.0, math.radians(90.0))
 
 from mjlab.envs import ManagerBasedRlEnvCfg
@@ -60,11 +86,10 @@ from mjlab_microduck.robot.microduck_constants import MICRODUCK_STANDUP_ROBOT_CF
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.microduck_velocity_env_cfg import HEAD_BODY_NAMES
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
-from mjlab_microduck.runner import MicroduckOnPolicyRunner
-from mjlab_microduck.tasks import register_mjlab_task
 
 
 def _jump_foot_clearance_reward(env, target_height: float, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Inline foot clearance penalty based on robot site positions, bypassing height scanner."""
     robot = env.scene[asset_cfg.name]
     site_pos = robot.data.site_pos_w[:, asset_cfg.site_ids, 2]
     pos_error = torch.square(target_height - site_pos)
@@ -72,6 +97,8 @@ def _jump_foot_clearance_reward(env, target_height: float, asset_cfg: SceneEntit
 
 
 def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+    """Create Microduck jump-with-rotation environment configuration."""
+
     feet_ground_cfg = ContactSensorCfg(
         name="feet_ground_contact",
         primary=ContactMatch(
@@ -97,30 +124,38 @@ def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
     foot_frictions_geom_names = ("left_foot_collision", "right_foot_collision")
 
+    # ── Base config ───────────────────────────────────────────────────────────
     cfg = make_velocity_env_cfg()
 
+    # Standup robot variant (full collision meshes) — a jump landing can put
+    # the robot in contact configurations a pure-walk model doesn't expect.
     cfg.scene.entities = {"robot": MICRODUCK_STANDUP_ROBOT_CFG}
     cfg.scene.sensors  = (feet_ground_cfg, self_collision_cfg)
     cfg.viewer.body_name = "trunk_base"
     cfg.episode_length_s = EPISODE_LENGTH_S
 
+    # ── Actions ───────────────────────────────────────────────────────────────
     joint_pos_action = cfg.actions["joint_pos"]
     assert isinstance(joint_pos_action, JointPositionActionCfg)
     joint_pos_action.scale = 1.0
 
+    # ── Rewards: drop walking-specific terms not relevant to a jump ─────────
     for name in ["track_linear_velocity", "pose", "air_time", "foot_swing_height"]:
         if name in cfg.rewards:
             del cfg.rewards[name]
 
+    # ── Launch: reward upward CoM velocity while below the jump apex gate.
     cfg.rewards["jump_launch"] = RewardTermCfg(
         func=microduck_mdp.com_upward_velocity,
         weight=2.0,
         params={"max_height": STAND_Z + 0.05, "max_vz": 1.5},
     )
 
+    # ── Rotation: base cfg's track_angular_velocity kept for heading command.
     cfg.rewards["track_angular_velocity"].weight = 2.0
     cfg.rewards["track_angular_velocity"].params["std"] = math.sqrt(0.5)
 
+    # ── Foot clearance — custom inline reward targeting sites directly
     cfg.rewards["foot_clearance"] = RewardTermCfg(
         func=_jump_foot_clearance_reward,
         weight=1.5,
@@ -131,6 +166,7 @@ def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     )
     cfg.rewards.pop("foot_slip", None)
 
+    # ── Stability ─────────────────────────────────────────────────────────────
     cfg.rewards["upright"].weight = 2.0
     cfg.rewards["upright"].params["asset_cfg"].body_names = ("trunk_base",)
     cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("trunk_base",)
@@ -145,18 +181,21 @@ def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     )
     cfg.rewards.pop("soft_landing", None)
 
+    # Gentle-landing shaping
     cfg.rewards["gentle_landing"] = RewardTermCfg(
         func=microduck_mdp.trunk_vertical_accel_penalty,
         weight=0.002,
         params={"asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",))},
     )
 
+    # ── Terminations ─────────────────────────────────────────────────────────
     cfg.terminations["nan_state"] = TerminationTermCfg(
         func=microduck_mdp.robot_state_is_nan,
         time_out=False,
         params={"sensor_names": (feet_ground_cfg.name,)},
     )
 
+    # ── Observations (61D layout parity with velocity/roulade/sitstand) ──────
     for group in ("actor", "critic"):
         for term in ("height_scan", "foot_height", "foot_height_scan"):
             if term in cfg.observations[group].terms:
@@ -196,6 +235,7 @@ def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             func=microduck_mdp.zero_command_padding, params={"dim": 6},
         )
 
+    # ── Command: rotate in place ─────────────────────────────────────────────
     command = deepcopy(cfg.commands["twist"])
     command.rel_standing_envs = 0.0
     command.rel_heading_envs  = 1.0
@@ -206,6 +246,7 @@ def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     command.resampling_time_range = (EPISODE_LENGTH_S, EPISODE_LENGTH_S)
     cfg.commands["twist"] = microduck_mdp.VelocityCommandCommandOnlyCfg(**vars(command))
 
+    # ── Terrain: flat only ────────────────────────────────────────────────────
     cfg.scene.terrain.terrain_type = "plane"
     cfg.scene.terrain.terrain_generator = None
     if "terrain_levels" in cfg.curriculum:
@@ -213,6 +254,7 @@ def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     if "command_vel" in cfg.curriculum:
         del cfg.curriculum["command_vel"]
 
+    # ── Events ───────────────────────────────────────────────────────────────
     cfg.events["expand_bam_friction_fields"] = EventTermCfg(
         func=microduck_mdp.expand_bam_friction_fields, mode="startup",
     )
@@ -293,6 +335,7 @@ def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             },
         )
 
+    # ── Curriculum ────────────────────────────────────────────────────────────
     cfg.curriculum["action_rate_weight"] = CurriculumTermCfg(
         func=microduck_mdp.reward_weight,
         params={
@@ -333,6 +376,7 @@ def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     return cfg
 
 
+# ── RL runner config ──────────────────────────────────────────────────────────
 MicroduckJumpRlCfg = RslRlOnPolicyRunnerCfg(
     actor=RslRlModelCfg(
         hidden_dims=(512, 256, 128),
@@ -370,13 +414,4 @@ MicroduckJumpRlCfg = RslRlOnPolicyRunnerCfg(
     save_interval=250,
     num_steps_per_env=24,
     max_iterations=1500,
-)
-
-# Self-register task on import
-register_mjlab_task(
-    task_id="Mjlab-Jump-Flat-MicroDuck",
-    env_cfg=make_microduck_jump_env_cfg(),
-    play_env_cfg=make_microduck_jump_env_cfg(play=True),
-    rl_cfg=MicroduckJumpRlCfg,
-    runner_cls=MicroduckOnPolicyRunner,
 )
