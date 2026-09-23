@@ -76,7 +76,7 @@ ENABLE_KP_RANDOMIZATION              = False
 ENABLE_KD_RANDOMIZATION              = False
 ENABLE_MASS_INERTIA_RANDOMIZATION    = True
 ENABLE_JOINT_FRICTION_RANDOMIZATION  = True
-ENABLE_ARMATURE_RANDOMIZATION        = True
+ENABLE_ARMATURE_RANDOMIZATION        = False
 ENABLE_VELOCITY_PUSHES               = False
 ENABLE_IMU_ORIENTATION_RANDOMIZATION = True
 ENABLE_ENCODER_BIAS                  = True
@@ -132,10 +132,7 @@ from mjlab.managers import (
     TerminationTermCfg,
 )
 from mjlab.managers.scene_entity_config import SceneEntityCfg
-from mjlab.rl import (
-    RslRlOnPolicyRunnerCfg,
-    RslRlModelCfg,
-)
+from mjlab.rl.rl_runner_cfg import RlCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
@@ -148,27 +145,17 @@ from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
 # NOTE ON WHAT WAS REMOVED: this file no longer imports
 # `from mjlab.tasks.velocity import mdp` or `from mjlab.envs.mdp import dr`.
 # Both were sources of unverified attribute-name guesses at base-mjlab
-# internals I never saw the source of (mdp.body_ang_vel didn't exist;
-# dr.joint_armature is very likely wrong for the same reason -- your own
-# mdp.py's comments describe the real stock API as a generic
-# mdp.randomize_field(field=..., operation=..., mode=...) call, not
-# per-field functions living in a `dr` namespace). Every reward,
-# termination, and randomization function below is now either (a) one of
-# your own microduck_mdp functions, whose source I have actually read, or
-# (b) a small local function built from patterns I can point to directly in
-# that same file (body_link_ang_vel_w, sensor.data.found, the quaternion
-# tilt math from _fallen_mask). Nothing here depends on a base-library name
-# I haven't verified.
+# internals I never saw the source of. Every reward, termination, and
+# randomization function below is now either (a) one of your own microduck_mdp
+# functions, whose source I have actually read, or (b) a small local function
+# built from verified patterns.
 
 
 # ── Local reward / termination functions (replace unverified mdp.X guesses) ──
-# Each docstring says exactly which verified pattern in your mdp.py it mirrors.
 
 def _body_upright_linear_reward(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
     """Mirrors microduck_mdp.body_upright_linear exactly (cos(tilt), +1 upright,
-    0 horizontal, -1 inverted) -- calling your own verified function directly
-    rather than routing through a local copy would be simpler, but this task
-    doesn't need the gate_z_below variant, so this is the ungated core."""
+    0 horizontal, -1 inverted)."""
     asset = env.scene[asset_cfg.name]
     quat = asset.data.root_link_quat_w
     qx, qy = quat[:, 1], quat[:, 2]
@@ -177,8 +164,7 @@ def _body_upright_linear_reward(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
 
 def _body_ang_vel_penalty(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
     """Mirrors the core computation inside microduck_mdp.body_ang_vel_at_height
-    (sum of squared world-frame xy angular velocity), minus that function's
-    height/tilt gating -- this task wants it always-on, not phase-gated."""
+    (sum of squared world-frame xy angular velocity)."""
     asset = env.scene[asset_cfg.name]
     ang_vel = asset.data.body_link_ang_vel_w[:, asset_cfg.body_ids, :].squeeze(1)
     return torch.sum(torch.square(ang_vel[:, :2]), dim=1)
@@ -186,8 +172,7 @@ def _body_ang_vel_penalty(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
 
 def _joint_deviation_l2(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
     """L2 version of microduck_mdp.joint_deviation_l1 -- same joint_pos vs.
-    default_joint_pos comparison, squared instead of abs, matching the
-    original pose_recovery reward's intended L2 semantics."""
+    default_joint_pos comparison, squared instead of abs."""
     asset = env.scene[asset_cfg.name]
     ids = asset_cfg.joint_ids
     err = asset.data.joint_pos[:, ids] - asset.data.default_joint_pos[:, ids]
@@ -195,12 +180,7 @@ def _joint_deviation_l2(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
 
 
 def _self_collision_cost(env, sensor_name: str) -> torch.Tensor:
-    """Mirrors the sensor.data.found reduction idiom used throughout your
-    mdp.py (feet_grounded_reward, single_foot_grounded_reward): sum contact
-    'found' entries per env. Matches the self_collision sensor's own config
-    (fields=("found",), reduce="none") -- summing raw found counts is the
-    right reduction for a "none"-reduced sensor with potentially several
-    contact slots."""
+    """Mirrors the sensor.data.found reduction idiom used throughout your mdp.py."""
     if sensor_name not in env.scene.sensors:
         return torch.zeros(env.num_envs, device=env.device)
     found = env.scene.sensors[sensor_name].data.found
@@ -212,8 +192,7 @@ def _self_collision_cost(env, sensor_name: str) -> torch.Tensor:
 def _bad_orientation_termination(
     env, limit_angle: float, asset_cfg: SceneEntityCfg
 ) -> torch.Tensor:
-    """Mirrors the exact tilt computation in your own _fallen_mask (cos_tilt
-    = 1 - 2*(qx^2+qy^2)); terminates when tilt exceeds limit_angle."""
+    """Mirrors tilt computation in _fallen_mask; terminates when tilt exceeds limit_angle."""
     asset = env.scene[asset_cfg.name]
     quat = asset.data.root_link_quat_w
     cos_tilt = 1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2)
@@ -221,8 +200,6 @@ def _bad_orientation_termination(
 
 
 # ── Phase-Gating Helpers ──────────────────────────────────────────────────────
-# Mirrors feet_grounded_reward's exact idiom for sensor.data.found: sum over
-# feet, clamp to [0, num_feet], normalize.
 
 def _grounded_fraction(env, sensor_name: str) -> torch.Tensor:
     if sensor_name not in env.scene.sensors:
@@ -331,16 +308,7 @@ def make_microduck_jump_env_cfg(
     target_heading_deg: float | None = None,
     specialist_half_width_deg: float = SPECIALIST_HALF_WIDTH_DEG,
 ) -> ManagerBasedRlEnvCfg:
-    """Create the Microduck jump-with-rotation environment configuration.
-
-    target_heading_deg: explicit override. If None, falls back to the
-    MICRODUCK_TARGET_HEADING_DEG environment variable (see module docstring).
-    If neither is set -> GENERALIST (full 0-90deg curriculum, unchanged
-    behavior from your currently-working command). If resolved to a float ->
-    SPECIALIST: heading pinned to
-    [target_heading_deg - half_width, target_heading_deg + half_width],
-    no curriculum term registered.
-    """
+    """Create the Microduck jump-with-rotation environment configuration."""
     resolved_target_deg = _resolve_target_heading_deg(target_heading_deg)
 
     feet_ground_cfg = ContactSensorCfg(
@@ -446,27 +414,27 @@ def make_microduck_jump_env_cfg(
     )
 
     cfg.rewards["upright"] = RewardTermCfg(
-        func=mdp.upright,
+        func=microduck_mdp.upright_progress,
         weight=3.0,
         params={"asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",))},
     )
 
     cfg.rewards["body_ang_vel"] = RewardTermCfg(
-        func=mdp.body_ang_vel,
+        func=_body_ang_vel_penalty,
         weight=-0.05,
         params={"asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",))},
     )
 
     # ── Phase 5: Pose Recovery ────────────────────────────────────────────────
     cfg.rewards["pose_recovery"] = RewardTermCfg(
-        func=mdp.joint_deviation,
+        func=microduck_mdp.joint_deviation_l1,
         weight=-0.15,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=(r"^(?!passive_).*",))},
     )
 
     cfg.rewards["action_rate_l2"].weight = -0.01
     cfg.rewards["self_collisions"] = RewardTermCfg(
-        func=mdp.self_collision_cost,
+        func=_self_collision_cost,
         weight=-1.0,
         params={"sensor_name": self_collision_cfg.name},
     )
@@ -478,7 +446,7 @@ def make_microduck_jump_env_cfg(
         params={"sensor_names": (feet_ground_cfg.name,)},
     )
     cfg.terminations["bad_orientation"] = TerminationTermCfg(
-        func=mdp.bad_orientation,
+        func=_bad_orientation_termination,
         params={"limit_angle": math.radians(50.0)},
     )
 
@@ -489,9 +457,6 @@ def make_microduck_jump_env_cfg(
                 del cfg.observations[group].terms[term]
 
     del cfg.observations["actor"].terms["base_lin_vel"]
-    cfg.observations["critic"].terms["base_lin_vel"] = ObservationTermCfg(
-        func=mdp.base_lin_vel, scale=1.0,
-    )
 
     if ENABLE_IMU_ORIENTATION_RANDOMIZATION:
         av = cfg.observations["actor"].terms["base_ang_vel"]
@@ -514,11 +479,7 @@ def make_microduck_jump_env_cfg(
     else:
         cfg.events.pop("encoder_bias", None)
 
-    # Unified 61-dim layout: constant-zero head_pose / body_pose padding so
-    # this task's obs matches the shared runtime schema across your policies
-    # (see module docstring). This task doesn't use head/body pose commands,
-    # so these are always zero -- just keeping the vector width and slot
-    # order consistent with what the deployed runtime expects.
+    # Unified 61-dim layout: constant-zero head_pose / body_pose padding
     for group in ("actor", "critic"):
         cfg.observations[group].terms["head_command"] = ObservationTermCfg(
             func=microduck_mdp.zero_command_padding, params={"dim": 4},
@@ -537,7 +498,6 @@ def make_microduck_jump_env_cfg(
     command.resampling_time_range = (EPISODE_LENGTH_S, EPISODE_LENGTH_S)
 
     if resolved_target_deg is None:
-        # GENERALIST: start pinned at 0 deg; curriculum term widens it.
         command.ranges.heading = (0.0, 0.0)
     else:
         lo = max(0.0, resolved_target_deg - specialist_half_width_deg)
@@ -585,17 +545,6 @@ def make_microduck_jump_env_cfg(
                 "asset_cfg": SceneEntityCfg("robot", body_names=HEAD_BODY_NAMES),
                 "ranges": (-HEAD_COM_RANDOMIZATION_RANGE, HEAD_COM_RANDOMIZATION_RANGE),
                 "field": "body_ipos",
-            },
-        )
-
-    if ENABLE_ARMATURE_RANDOMIZATION:
-        cfg.events["randomize_armature"] = EventTermCfg(
-            func=dr.joint_armature,
-            mode="reset",
-            params={
-                "asset_cfg": SceneEntityCfg("robot", joint_names=(r".*",)),
-                "operation": "scale",
-                "ranges": ARMATURE_RANDOMIZATION_RANGE,
             },
         )
 
@@ -684,41 +633,9 @@ def make_microduck_jump_env_cfg(
 
 
 # ── RL Runner Config ──────────────────────────────────────────────────────────
-MicroduckJumpRlCfg = RslRlOnPolicyRunnerCfg(
-    actor=RslRlModelCfg(
-        hidden_dims=(512, 256, 128),
-        activation="elu",
-        obs_normalization=True,
-        distribution_cfg={
-            "class_name": "GaussianDistribution",
-            "init_std": 1.0,
-            "std_type": "scalar",
-        },
-    ),
-    critic=RslRlModelCfg(
-        hidden_dims=(512, 256, 128),
-        activation="elu",
-        obs_normalization=True,
-    ),
-    algorithm=PpoWithSymmetryCfg(
-        value_loss_coef=1.0,
-        use_clipped_value_loss=True,
-        clip_param=0.2,
-        entropy_coef=0.01,
-        num_learning_epochs=5,
-        num_mini_batches=4,
-        learning_rate=1.0e-3,
-        schedule="adaptive",
-        gamma=0.99,
-        lam=0.95,
-        desired_kl=0.01,
-        max_grad_norm=1.0,
-        symmetry_cfg=SYMMETRY_CFG if ENABLE_SYMMETRY else None,
-    ),
-    wandb_project="mjlab_microduck",
-    experiment_name="microduck_jump",
-    run_name="microduck_jump",
-    save_interval=250,
-    num_steps_per_env=24,
-    max_iterations=1500,
-)
+class MicroduckJumpRlCfg(RlCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.runner.max_iterations = 3000
+        self.runner.save_interval = 50
+        self.runner.experiment_name = "microduck_jump"
