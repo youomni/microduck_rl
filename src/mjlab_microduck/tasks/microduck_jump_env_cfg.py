@@ -46,17 +46,18 @@ running the real specialist sequence. Building the whole plan on an unverified
 resume flag is exactly the kind of silent failure that hit the earlier
 cfg.commands.heading bug.
 
-51-DIM OBSERVATION -- CORRECTED FROM THE PREVIOUS REVISION
---------------------------------------------------------------
-The previous revision added two zero-padding observation terms
-(head_command: 4 dims, body_command: 6 dims) copied speculatively from a
-DIFFERENT part of your mdp.py (the "unified pose command machinery" section,
-used by other policies such as sitstand/ground_pick, not necessarily this
-jump task). That would push actor obs to 61 dims, not the 51 you've stated
-is the real fixed deployed input. Removed here. Please confirm your actual
-runtime schema still comes out to 51 without it -- I have not computed the
-exact width from your VelocityEnvCfg defaults, so this is your number to
-verify, not mine to assert.
+61-DIM OBSERVATION -- CONFIRMED, PADDING TERMS RESTORED
+-------------------------------------------------------------
+Confirmed as 61 dims (the "51" in an earlier pass was a typo), matching your
+mdp.py's "unified pose command machinery" layout: a shared 13-dim command
+block (twist 3 + head_pose 4 + body_pose 6) across all your policies so one
+runtime obs-parsing pipeline works for all of them. This task doesn't
+actively use head_pose/body_pose, so those two blocks are present as
+constant-zero padding (head_command: 4 dims, body_command: 6 dims) purely to
+keep the vector layout consistent with the other policies sharing the
+runtime. Restored below -- my previous pass removed them on a mistaken
+"51 means no padding" assumption; that assumption was wrong, not this
+padding.
 """
 
 import math
@@ -441,14 +442,18 @@ def make_microduck_jump_env_cfg(
     else:
         cfg.events.pop("encoder_bias", None)
 
-    # NOTE: no head_command / body_command zero-padding terms here -- see
-    # module docstring. If your runtime DOES expect the unified 61-dim
-    # layout for this task after all, re-add:
-    #   for group in ("actor", "critic"):
-    #       cfg.observations[group].terms["head_command"] = ObservationTermCfg(
-    #           func=microduck_mdp.zero_command_padding, params={"dim": 4})
-    #       cfg.observations[group].terms["body_command"] = ObservationTermCfg(
-    #           func=microduck_mdp.zero_command_padding, params={"dim": 6})
+    # Unified 61-dim layout: constant-zero head_pose / body_pose padding so
+    # this task's obs matches the shared runtime schema across your policies
+    # (see module docstring). This task doesn't use head/body pose commands,
+    # so these are always zero -- just keeping the vector width and slot
+    # order consistent with what the deployed runtime expects.
+    for group in ("actor", "critic"):
+        cfg.observations[group].terms["head_command"] = ObservationTermCfg(
+            func=microduck_mdp.zero_command_padding, params={"dim": 4},
+        )
+        cfg.observations[group].terms["body_command"] = ObservationTermCfg(
+            func=microduck_mdp.zero_command_padding, params={"dim": 6},
+        )
 
     # ── Commands ──────────────────────────────────────────────────────────────
     command = deepcopy(cfg.commands["twist"])
