@@ -1,35 +1,74 @@
-"""Microduck jump-with-rotation task.
+"""Microduck phase-conditioned jump-with-rotation task.
 
-Episodic dynamic-jump policy: robot launches upward and rotates in place
-(yaw twist) before landing back on its feet.
+Phases of the jump-twist trajectory:
+  1. Crouch & Pre-Twist  : Lower CoM (crouch) while initiating yaw momentum.
+  2. Launch & Air-Twist  : Thrust upward, use head/hip reaction torque to rotate.
+  3. Soft Touchdown      : Absorb impact with flexed knees, maintaining orientation.
+  4. Stabilization       : Dampen residual momentum and align base upright.
+  5. Standup Recovery    : Return joints to default standing stance (STAND_Z).
 
-Rebuilt on the real mjlab_microduck pattern — mjlab 1.3.0 has no configclass
-Cfg-subclassing API (the earlier version of this file assumed one and didn't
-import). Every task in this project is a plain `make_X_env_cfg(play) -> cfg`
-function that starts from `make_velocity_env_cfg()` and mutates the returned
-dict-based cfg, exactly like microduck_roulade_env_cfg.py / _sitstand_.
+HOW TARGET_HEADING_DEG IS WIRED (IMPORTANT -- READ BEFORE RELYING ON THIS)
+----------------------------------------------------------------------------
+Your working command,
 
-STATUS: first-pass port of the original design intent (encourage vertical
-launch via com_upward_velocity, rotate via the twist command's heading
-field, keep foot-clearance/stability shaping, gentle action smoothing) onto
-the real API. It imports and registers, but — like roulade's "attempt 3,
-run 2" — the reward weights below are a starting point, not a tuned recipe.
-Expect to iterate once you see early training behavior (e.g. whether
-com_upward_velocity's max_height/max_vz actually rewards a clean launch
-instead of repeated bouncing, and whether the heading-rotation reward needs
-its own dedicated term rather than relying on track_angular_velocity, which
-this file currently drops).
+    uv run python -m mjlab_microduck.train_cli Mjlab-Jump-Flat-MicroDuck \
+        --env.scene.num-envs 2048 --agent.max-iterations 3000 \
+        --agent.save-interval 50
+
+proves the CLI accepts --env.scene.num-envs / --agent.max-iterations /
+--agent.save-interval, and nothing else. It does NOT prove any particular
+flag exists for setting a per-run target rotation, and it does not prove any
+particular resume/checkpoint-loading flag exists either -- I have not seen
+your train_cli.py or your task registration file.
+
+Rather than guess a --env.target-heading-deg-style CLI flag that might not
+be wired through tyro to this function's parameters, make_microduck_jump_env_cfg
+below reads the target angle from the MICRODUCK_TARGET_HEADING_DEG
+environment variable itself, as a fallback when target_heading_deg is not
+passed explicitly in code. This only depends on two things I'm confident are
+true: (1) your task registration calls this exact function to build the env
+cfg (implied by your working command training an env registered under
+"Mjlab-Jump-Flat-MicroDuck"), and (2) shell environment variables set before
+a command reach that command's Python process (standard shell behavior,
+not a guess). Calling make_microduck_jump_env_cfg() with no target set --
+exactly what your verified generalist command does today -- is completely
+unaffected: it still builds the generalist, unchanged.
+
+WHAT I STILL DO NOT KNOW -- VERIFY BEFORE THE SPECIALIST STAGES
+-------------------------------------------------------------------
+Resuming a specialist fine-tune FROM A SPECIFIC PARENT CHECKPOINT (not just
+"whatever ran most recently") needs some CLI mechanism I have not seen and
+cannot confirm the name of. Run a 5-iteration dry run of whatever flag you
+believe does this and confirm the loaded weights actually come from the
+intended parent (e.g. check that loss/reward at iteration 0 of the fine-tune
+looks like a warm-started policy, not a freshly initialized one) before
+running the real specialist sequence. Building the whole plan on an unverified
+resume flag is exactly the kind of silent failure that hit the earlier
+cfg.commands.heading bug.
+
+51-DIM OBSERVATION -- CORRECTED FROM THE PREVIOUS REVISION
+--------------------------------------------------------------
+The previous revision added two zero-padding observation terms
+(head_command: 4 dims, body_command: 6 dims) copied speculatively from a
+DIFFERENT part of your mdp.py (the "unified pose command machinery" section,
+used by other policies such as sitstand/ground_pick, not necessarily this
+jump task). That would push actor obs to 61 dims, not the 51 you've stated
+is the real fixed deployed input. Removed here. Please confirm your actual
+runtime schema still comes out to 51 without it -- I have not computed the
+exact width from your VelocityEnvCfg defaults, so this is your number to
+verify, not mine to assert.
 """
 
 import math
+import os
 from copy import deepcopy
+from typing import cast
+
 import torch
 
-# Symmetry: a yaw rotation is NOT left/right symmetric (spinning one way vs
-# the other are different maneuvers) — same reasoning as microduck_spin.
 ENABLE_SYMMETRY = False
 
-# ── Domain randomisation (matched to roulade/velocity for sim2real parity) ───
+# ── Domain Randomization Parity ───────────────────────────────────────────────
 ENABLE_COM_RANDOMIZATION             = True
 ENABLE_HEAD_COM_RANDOMIZATION        = True
 ENABLE_KP_RANDOMIZATION              = False
@@ -37,7 +76,7 @@ ENABLE_KD_RANDOMIZATION              = False
 ENABLE_MASS_INERTIA_RANDOMIZATION    = True
 ENABLE_JOINT_FRICTION_RANDOMIZATION  = True
 ENABLE_ARMATURE_RANDOMIZATION        = True
-ENABLE_VELOCITY_PUSHES               = False  # a push mid-jump is incoherent (roulade's reasoning)
+ENABLE_VELOCITY_PUSHES               = False
 ENABLE_IMU_ORIENTATION_RANDOMIZATION = True
 ENABLE_ENCODER_BIAS                  = True
 
@@ -47,20 +86,40 @@ MASS_INERTIA_RANDOMIZATION_RANGE    = (0.95, 1.05)
 ARMATURE_RANDOMIZATION_RANGE        = (0.9, 1.1)
 JOINT_FRICTION_RANDOMIZATION_RANGE  = (0.9, 1.1)
 ENCODER_BIAS_RANGE                  = (-0.015, 0.015)
-KP_RANDOMIZATION_RANGE              = (0.85, 1.15)  # unused (kp DR off)
-KD_RANDOMIZATION_RANGE              = (0.9, 1.1)    # unused (kd DR off)
+KP_RANDOMIZATION_RANGE              = (0.85, 1.15)
+KD_RANDOMIZATION_RANGE              = (0.9, 1.1)
 IMU_ORIENTATION_RANDOMIZATION_ANGLE = 6.0
 
 EPISODE_LENGTH_S = 4.0
-
-# Measured standing trunk height (same value used by sitstand/roulade — don't
-# guess this, re-verify in sim if the robot/keyframe changes).
 STAND_Z = 0.115
 
-# In-place rotation target, ported from the original design intent (0-90°
-# per episode). This is a field on the shared twist/velocity command, not a
-# standalone command class — see the command section below.
+# Final generalist target range. The step curriculum starts at (0, 0) and
+# widens the upper bound toward this over training. Also the clamp bound for
+# a specialist's target_heading_deg.
 JUMP_HEADING_RANGE = (0.0, math.radians(90.0))
+
+# Nominal robot weight in Newtons: Mass (~2.04 kg) * g (9.81 m/s^2). Verify
+# against your actual robot mass.
+STATIC_SUPPORT_FORCE_N = 20.0
+
+# (training_step, max_degrees) for the GENERALIST's rotation curriculum.
+# TUNE to your iteration budget by watching reward curves.
+HEADING_DEGREE_STAGES = [
+    {"step": 0,          "max_deg": 0.0},
+    {"step": 300 * 24,   "max_deg": 5.0},
+    {"step": 500 * 24,   "max_deg": 10.0},
+    {"step": 700 * 24,   "max_deg": 20.0},
+    {"step": 900 * 24,   "max_deg": 35.0},
+    {"step": 1100 * 24,  "max_deg": 50.0},
+    {"step": 1300 * 24,  "max_deg": 70.0},
+    {"step": 1450 * 24,  "max_deg": 90.0},
+]
+
+# Env var read as a fallback source for target_heading_deg -- see module
+# docstring for exactly what this does and does not depend on.
+_TARGET_HEADING_ENV_VAR = "MICRODUCK_TARGET_HEADING_DEG"
+
+SPECIALIST_HALF_WIDTH_DEG = 0.5
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
@@ -79,8 +138,8 @@ from mjlab.rl import (
 )
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.tasks.velocity import mdp
+from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
-from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
 from mjlab_microduck.robot.microduck_constants import MICRODUCK_STANDUP_ROBOT_CFG
 from mjlab_microduck.tasks import mdp as microduck_mdp
@@ -88,16 +147,128 @@ from mjlab_microduck.tasks.microduck_velocity_env_cfg import HEAD_BODY_NAMES
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
 
 
-def _jump_foot_clearance_reward(env, target_height: float, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Inline foot clearance penalty based on robot site positions, bypassing height scanner."""
+# ── Phase-Gating Helpers ──────────────────────────────────────────────────────
+# Mirrors feet_grounded_reward's exact idiom for sensor.data.found: sum over
+# feet, clamp to [0, num_feet], normalize.
+
+def _grounded_fraction(env, sensor_name: str) -> torch.Tensor:
+    if sensor_name not in env.scene.sensors:
+        return torch.ones(env.num_envs, device=env.device)
+    sensor = env.scene.sensors[sensor_name]
+    found = sensor.data.found
+    if found.dim() > 1:
+        found = found.sum(dim=-1)
+    return torch.clamp(found, 0.0, 2.0) / 2.0
+
+
+def _airborne_fraction(env, sensor_name: str) -> torch.Tensor:
+    return 1.0 - _grounded_fraction(env, sensor_name)
+
+
+def _pre_liftoff_gate(env, sensor_name: str) -> torch.Tensor:
+    grounded = _grounded_fraction(env, sensor_name)
+    max_len = max(getattr(env, "max_episode_length", 100), 1)
+    frac = env.episode_length_buf.float() / float(max_len)
+    early_phase = (frac < 0.25).float()
+    return grounded * early_phase
+
+
+# ── Phased Reward Functions ───────────────────────────────────────────────────
+
+def _crouch_and_pretwist_reward(env, sensor_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    robot = env.scene[asset_cfg.name]
+    trunk_z = robot.data.root_link_pos_w[:, 2]
+    crouch_target = STAND_Z - 0.025
+    crouch_err = torch.square(trunk_z - crouch_target)
+    raw = torch.exp(-crouch_err / 0.01)
+    return raw * _pre_liftoff_gate(env, sensor_name)
+
+
+def _reaction_torque_reward(env, sensor_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    robot = env.scene[asset_cfg.name]
+    joint_vel = robot.data.joint_vel[:, asset_cfg.joint_ids]
+    raw = torch.sum(torch.square(joint_vel), dim=1)
+    return raw * _airborne_fraction(env, sensor_name)
+
+
+def _soft_touchdown_impact_penalty(env, sensor_name: str) -> torch.Tensor:
+    contact_sensor = env.scene.sensors[sensor_name]
+    net_force = contact_sensor.data.net_force_w
+    force_mag = torch.norm(net_force, dim=-1)
+    excess = torch.clamp(force_mag - STATIC_SUPPORT_FORCE_N, min=0.0)
+    return torch.square(excess)
+
+
+def _jump_foot_clearance_reward(
+    env, sensor_name: str, target_height: float, asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
     robot = env.scene[asset_cfg.name]
     site_pos = robot.data.site_pos_w[:, asset_cfg.site_ids, 2]
     pos_error = torch.square(target_height - site_pos)
-    return torch.sum(pos_error, dim=1)
+    raw = torch.sum(pos_error, dim=1)
+    return raw * _airborne_fraction(env, sensor_name)
 
 
-def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-    """Create Microduck jump-with-rotation environment configuration."""
+# ── Rotation-angle curriculum (GENERALIST only) ───────────────────────────────
+
+def heading_range_step_curriculum(
+    env,
+    env_ids,
+    command_name: str,
+    degree_stages: list,
+) -> torch.Tensor:
+    """Mirrors com_range_curriculum: read env.common_step_counter, find the
+    latest stage whose step has elapsed, write into the live command term's
+    cfg.ranges.heading."""
+    del env_ids
+
+    command_term = env.command_manager.get_term(command_name)
+    assert command_term is not None, f"Command term '{command_name}' not found"
+    cfg = cast(UniformVelocityCommandCfg, command_term.cfg)
+
+    current_max_deg = degree_stages[0]["max_deg"]
+    for stage in degree_stages:
+        if env.common_step_counter > stage["step"]:
+            current_max_deg = stage["max_deg"]
+
+    cfg.ranges.heading = (0.0, math.radians(current_max_deg))
+    return torch.tensor([current_max_deg])
+
+
+def _resolve_target_heading_deg(target_heading_deg: float | None) -> float | None:
+    """target_heading_deg if given; else MICRODUCK_TARGET_HEADING_DEG if set
+    and parseable; else None (generalist mode)."""
+    if target_heading_deg is not None:
+        return target_heading_deg
+    env_val = os.environ.get(_TARGET_HEADING_ENV_VAR)
+    if env_val is None or env_val == "":
+        return None
+    try:
+        return float(env_val)
+    except ValueError:
+        raise ValueError(
+            f"{_TARGET_HEADING_ENV_VAR}={env_val!r} is not a valid float"
+        )
+
+
+# ── Environment Configuration Factory ─────────────────────────────────────────
+
+def make_microduck_jump_env_cfg(
+    play: bool = False,
+    target_heading_deg: float | None = None,
+    specialist_half_width_deg: float = SPECIALIST_HALF_WIDTH_DEG,
+) -> ManagerBasedRlEnvCfg:
+    """Create the Microduck jump-with-rotation environment configuration.
+
+    target_heading_deg: explicit override. If None, falls back to the
+    MICRODUCK_TARGET_HEADING_DEG environment variable (see module docstring).
+    If neither is set -> GENERALIST (full 0-90deg curriculum, unchanged
+    behavior from your currently-working command). If resolved to a float ->
+    SPECIALIST: heading pinned to
+    [target_heading_deg - half_width, target_heading_deg + half_width],
+    no curriculum term registered.
+    """
+    resolved_target_deg = _resolve_target_heading_deg(target_heading_deg)
 
     feet_ground_cfg = ContactSensorCfg(
         name="feet_ground_contact",
@@ -124,13 +295,11 @@ def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
     foot_frictions_geom_names = ("left_foot_collision", "right_foot_collision")
 
-    # ── Base config ───────────────────────────────────────────────────────────
+    # ── Base Config ───────────────────────────────────────────────────────────
     cfg = make_velocity_env_cfg()
 
-    # Standup robot variant (full collision meshes) — a jump landing can put
-    # the robot in contact configurations a pure-walk model doesn't expect.
     cfg.scene.entities = {"robot": MICRODUCK_STANDUP_ROBOT_CFG}
-    cfg.scene.sensors  = (feet_ground_cfg, self_collision_cfg)
+    cfg.scene.sensors = (feet_ground_cfg, self_collision_cfg)
     cfg.viewer.body_name = "trunk_base"
     cfg.episode_length_s = EPISODE_LENGTH_S
 
@@ -139,39 +308,88 @@ def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     assert isinstance(joint_pos_action, JointPositionActionCfg)
     joint_pos_action.scale = 1.0
 
-    # ── Rewards: drop walking-specific terms not relevant to a jump ─────────
+    # ── Rewards Clean-Up ──────────────────────────────────────────────────────
     for name in ["track_linear_velocity", "pose", "air_time", "foot_swing_height"]:
         if name in cfg.rewards:
             del cfg.rewards[name]
 
-    # ── Launch: reward upward CoM velocity while below the jump apex gate.
+    # ── Phase 1: Crouch & Pre-Twist ───────────────────────────────────────────
+    cfg.rewards["crouch_prep"] = RewardTermCfg(
+        func=_crouch_and_pretwist_reward,
+        weight=0.5,
+        params={
+            "sensor_name": feet_ground_cfg.name,
+            "asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",)),
+        },
+    )
+
+    # ── Phase 2: Launch & Air-Twist ───────────────────────────────────────────
     cfg.rewards["jump_launch"] = RewardTermCfg(
         func=microduck_mdp.com_upward_velocity,
-        weight=2.0,
+        weight=1.2,
         params={"max_height": STAND_Z + 0.05, "max_vz": 1.5},
     )
 
-    # ── Rotation: base cfg's track_angular_velocity kept for heading command.
-    cfg.rewards["track_angular_velocity"].weight = 2.0
+    cfg.rewards["head_yaw_momentum"] = RewardTermCfg(
+        func=_reaction_torque_reward,
+        weight=0.05,
+        params={
+            "sensor_name": feet_ground_cfg.name,
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=("head_yaw", "head_roll", "head_pitch", "neck_pitch")
+            ),
+        },
+    )
+
+    cfg.rewards["hip_yaw_momentum"] = RewardTermCfg(
+        func=_reaction_torque_reward,
+        weight=0.05,
+        params={
+            "sensor_name": feet_ground_cfg.name,
+            "asset_cfg": SceneEntityCfg(
+                "robot", joint_names=("left_hip_yaw", "right_hip_yaw")
+            ),
+        },
+    )
+
+    cfg.rewards["track_angular_velocity"].weight = 1.5
     cfg.rewards["track_angular_velocity"].params["std"] = math.sqrt(0.5)
 
-    # ── Foot clearance — custom inline reward targeting sites directly
     cfg.rewards["foot_clearance"] = RewardTermCfg(
         func=_jump_foot_clearance_reward,
-        weight=1.5,
+        weight=1.0,
         params={
+            "sensor_name": feet_ground_cfg.name,
             "target_height": 0.03,
             "asset_cfg": SceneEntityCfg("robot", site_names=("left_foot", "right_foot")),
         },
     )
-    cfg.rewards.pop("foot_slip", None)
 
-    # ── Stability ─────────────────────────────────────────────────────────────
-    cfg.rewards["upright"].weight = 2.0
-    cfg.rewards["upright"].params["asset_cfg"].body_names = ("trunk_base",)
-    cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("trunk_base",)
-    cfg.rewards["body_ang_vel"].weight = -0.05
-    cfg.rewards["angular_momentum"].weight = -0.02
+    # ── Phase 3 & 4: Touchdown & Stabilization ────────────────────────────────
+    cfg.rewards["impact_penalty"] = RewardTermCfg(
+        func=_soft_touchdown_impact_penalty,
+        weight=-1.0e-5,
+        params={"sensor_name": feet_ground_cfg.name},
+    )
+
+    cfg.rewards["upright"] = RewardTermCfg(
+        func=mdp.upright,
+        weight=3.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",))},
+    )
+
+    cfg.rewards["body_ang_vel"] = RewardTermCfg(
+        func=mdp.body_ang_vel,
+        weight=-0.05,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",))},
+    )
+
+    # ── Phase 5: Pose Recovery ────────────────────────────────────────────────
+    cfg.rewards["pose_recovery"] = RewardTermCfg(
+        func=mdp.joint_deviation,
+        weight=-0.15,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=(r"^(?!passive_).*",))},
+    )
 
     cfg.rewards["action_rate_l2"].weight = -0.01
     cfg.rewards["self_collisions"] = RewardTermCfg(
@@ -179,23 +397,19 @@ def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         weight=-1.0,
         params={"sensor_name": self_collision_cfg.name},
     )
-    cfg.rewards.pop("soft_landing", None)
 
-    # Gentle-landing shaping
-    cfg.rewards["gentle_landing"] = RewardTermCfg(
-        func=microduck_mdp.trunk_vertical_accel_penalty,
-        weight=0.002,
-        params={"asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",))},
-    )
-
-    # ── Terminations ─────────────────────────────────────────────────────────
+    # ── Terminations ──────────────────────────────────────────────────────────
     cfg.terminations["nan_state"] = TerminationTermCfg(
         func=microduck_mdp.robot_state_is_nan,
         time_out=False,
         params={"sensor_names": (feet_ground_cfg.name,)},
     )
+    cfg.terminations["bad_orientation"] = TerminationTermCfg(
+        func=mdp.bad_orientation,
+        params={"limit_angle": math.radians(50.0)},
+    )
 
-    # ── Observations (61D layout parity with velocity/roulade/sitstand) ──────
+    # ── Observations ──────────────────────────────────────────────────────────
     for group in ("actor", "critic"):
         for term in ("height_scan", "foot_height", "foot_height_scan"):
             if term in cfg.observations[group].terms:
@@ -227,26 +441,35 @@ def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     else:
         cfg.events.pop("encoder_bias", None)
 
-    for group in ("actor", "critic"):
-        cfg.observations[group].terms["head_command"] = ObservationTermCfg(
-            func=microduck_mdp.zero_command_padding, params={"dim": 4},
-        )
-        cfg.observations[group].terms["body_command"] = ObservationTermCfg(
-            func=microduck_mdp.zero_command_padding, params={"dim": 6},
-        )
+    # NOTE: no head_command / body_command zero-padding terms here -- see
+    # module docstring. If your runtime DOES expect the unified 61-dim
+    # layout for this task after all, re-add:
+    #   for group in ("actor", "critic"):
+    #       cfg.observations[group].terms["head_command"] = ObservationTermCfg(
+    #           func=microduck_mdp.zero_command_padding, params={"dim": 4})
+    #       cfg.observations[group].terms["body_command"] = ObservationTermCfg(
+    #           func=microduck_mdp.zero_command_padding, params={"dim": 6})
 
-    # ── Command: rotate in place ─────────────────────────────────────────────
+    # ── Commands ──────────────────────────────────────────────────────────────
     command = deepcopy(cfg.commands["twist"])
     command.rel_standing_envs = 0.0
     command.rel_heading_envs  = 1.0
     command.heading_command   = True
-    command.ranges.heading    = JUMP_HEADING_RANGE
     command.ranges.lin_vel_x  = (0.0, 0.0)
     command.ranges.lin_vel_y  = (0.0, 0.0)
     command.resampling_time_range = (EPISODE_LENGTH_S, EPISODE_LENGTH_S)
+
+    if resolved_target_deg is None:
+        # GENERALIST: start pinned at 0 deg; curriculum term widens it.
+        command.ranges.heading = (0.0, 0.0)
+    else:
+        lo = max(0.0, resolved_target_deg - specialist_half_width_deg)
+        hi = min(math.degrees(JUMP_HEADING_RANGE[1]), resolved_target_deg + specialist_half_width_deg)
+        command.ranges.heading = (math.radians(lo), math.radians(hi))
+
     cfg.commands["twist"] = microduck_mdp.VelocityCommandCommandOnlyCfg(**vars(command))
 
-    # ── Terrain: flat only ────────────────────────────────────────────────────
+    # ── Terrain & Events ──────────────────────────────────────────────────────
     cfg.scene.terrain.terrain_type = "plane"
     cfg.scene.terrain.terrain_generator = None
     if "terrain_levels" in cfg.curriculum:
@@ -254,7 +477,6 @@ def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     if "command_vel" in cfg.curriculum:
         del cfg.curriculum["command_vel"]
 
-    # ── Events ───────────────────────────────────────────────────────────────
     cfg.events["expand_bam_friction_fields"] = EventTermCfg(
         func=microduck_mdp.expand_bam_friction_fields, mode="startup",
     )
@@ -269,23 +491,23 @@ def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
     if ENABLE_COM_RANDOMIZATION:
         cfg.events["randomize_com"] = EventTermCfg(
-            func=dr.body_ipos,
+            func=microduck_mdp.randomize_com,
             mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",)),
-                "operation": "add",
                 "ranges": (-COM_RANDOMIZATION_RANGE, COM_RANDOMIZATION_RANGE),
+                "field": "body_ipos",
             },
         )
 
     if ENABLE_HEAD_COM_RANDOMIZATION:
         cfg.events["randomize_head_com"] = EventTermCfg(
-            func=dr.body_ipos,
+            func=microduck_mdp.randomize_com,
             mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot", body_names=HEAD_BODY_NAMES),
-                "operation": "add",
                 "ranges": (-HEAD_COM_RANDOMIZATION_RANGE, HEAD_COM_RANDOMIZATION_RANGE),
+                "field": "body_ipos",
             },
         )
 
@@ -311,13 +533,12 @@ def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         )
 
     if ENABLE_MASS_INERTIA_RANDOMIZATION:
-        _mi_lo, _mi_hi = MASS_INERTIA_RANDOMIZATION_RANGE
         cfg.events["randomize_mass_inertia"] = EventTermCfg(
-            func=dr.pseudo_inertia,
-            mode="startup",
+            func=microduck_mdp.randomize_mass_and_inertia,
+            mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",)),
-                "alpha_range": (math.log(_mi_lo) / 2.0, math.log(_mi_hi) / 2.0),
+                "scale_range": MASS_INERTIA_RANDOMIZATION_RANGE,
             },
         )
 
@@ -329,7 +550,6 @@ def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot"),
-                "operation": "scale",
                 "kp_range": kp_range,
                 "kd_range": kd_range,
             },
@@ -339,11 +559,11 @@ def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.curriculum["action_rate_weight"] = CurriculumTermCfg(
         func=microduck_mdp.reward_weight,
         params={
-            "reward_name":   "action_rate_l2",
+            "reward_name": "action_rate_l2",
             "weight_stages": [
-                {"step": 0,          "weight": -0.01},
-                {"step": 500 * 24,   "weight": -0.05},
-                {"step": 1000 * 24,  "weight": -0.1},
+                {"step": 0, "weight": -0.01},
+                {"step": 500 * 24, "weight": -0.05},
+                {"step": 1000 * 24, "weight": -0.1},
             ],
         },
     )
@@ -354,9 +574,9 @@ def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             params={
                 "event_name": "randomize_com",
                 "range_stages": [
-                    {"step": 0,          "range": 0.003},
-                    {"step": 500 * 24,   "range": 0.01},
-                    {"step": 1000 * 24,  "range": 0.015},
+                    {"step": 0, "range": 0.003},
+                    {"step": 500 * 24, "range": 0.01},
+                    {"step": 1000 * 24, "range": 0.015},
                 ],
             },
         )
@@ -367,16 +587,26 @@ def make_microduck_jump_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             params={
                 "event_name": "randomize_head_com",
                 "range_stages": [
-                    {"step": 0,         "range": 0.003},
-                    {"step": 500 * 24,  "range": 0.01},
+                    {"step": 0, "range": 0.003},
+                    {"step": 500 * 24, "range": 0.01},
                 ],
+            },
+        )
+
+    # Rotation-angle curriculum: GENERALIST ONLY.
+    if resolved_target_deg is None:
+        cfg.curriculum["heading_range"] = CurriculumTermCfg(
+            func=heading_range_step_curriculum,
+            params={
+                "command_name": "twist",
+                "degree_stages": HEADING_DEGREE_STAGES,
             },
         )
 
     return cfg
 
 
-# ── RL runner config ──────────────────────────────────────────────────────────
+# ── RL Runner Config ──────────────────────────────────────────────────────────
 MicroduckJumpRlCfg = RslRlOnPolicyRunnerCfg(
     actor=RslRlModelCfg(
         hidden_dims=(512, 256, 128),
