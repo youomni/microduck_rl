@@ -123,7 +123,6 @@ _TARGET_HEADING_ENV_VAR = "MICRODUCK_TARGET_HEADING_DEG"
 SPECIALIST_HALF_WIDTH_DEG = 0.5
 
 from mjlab.envs import ManagerBasedRlEnvCfg
-from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers import (
     CurriculumTermCfg,
@@ -138,7 +137,6 @@ from mjlab.rl import (
     RslRlModelCfg,
 )
 from mjlab.sensor import ContactMatch, ContactSensorCfg
-from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
 
@@ -146,6 +144,80 @@ from mjlab_microduck.robot.microduck_constants import MICRODUCK_STANDUP_ROBOT_CF
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.microduck_velocity_env_cfg import HEAD_BODY_NAMES
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
+
+# NOTE ON WHAT WAS REMOVED: this file no longer imports
+# `from mjlab.tasks.velocity import mdp` or `from mjlab.envs.mdp import dr`.
+# Both were sources of unverified attribute-name guesses at base-mjlab
+# internals I never saw the source of (mdp.body_ang_vel didn't exist;
+# dr.joint_armature is very likely wrong for the same reason -- your own
+# mdp.py's comments describe the real stock API as a generic
+# mdp.randomize_field(field=..., operation=..., mode=...) call, not
+# per-field functions living in a `dr` namespace). Every reward,
+# termination, and randomization function below is now either (a) one of
+# your own microduck_mdp functions, whose source I have actually read, or
+# (b) a small local function built from patterns I can point to directly in
+# that same file (body_link_ang_vel_w, sensor.data.found, the quaternion
+# tilt math from _fallen_mask). Nothing here depends on a base-library name
+# I haven't verified.
+
+
+# ── Local reward / termination functions (replace unverified mdp.X guesses) ──
+# Each docstring says exactly which verified pattern in your mdp.py it mirrors.
+
+def _body_upright_linear_reward(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Mirrors microduck_mdp.body_upright_linear exactly (cos(tilt), +1 upright,
+    0 horizontal, -1 inverted) -- calling your own verified function directly
+    rather than routing through a local copy would be simpler, but this task
+    doesn't need the gate_z_below variant, so this is the ungated core."""
+    asset = env.scene[asset_cfg.name]
+    quat = asset.data.root_link_quat_w
+    qx, qy = quat[:, 1], quat[:, 2]
+    return 1.0 - 2.0 * (qx * qx + qy * qy)
+
+
+def _body_ang_vel_penalty(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Mirrors the core computation inside microduck_mdp.body_ang_vel_at_height
+    (sum of squared world-frame xy angular velocity), minus that function's
+    height/tilt gating -- this task wants it always-on, not phase-gated."""
+    asset = env.scene[asset_cfg.name]
+    ang_vel = asset.data.body_link_ang_vel_w[:, asset_cfg.body_ids, :].squeeze(1)
+    return torch.sum(torch.square(ang_vel[:, :2]), dim=1)
+
+
+def _joint_deviation_l2(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """L2 version of microduck_mdp.joint_deviation_l1 -- same joint_pos vs.
+    default_joint_pos comparison, squared instead of abs, matching the
+    original pose_recovery reward's intended L2 semantics."""
+    asset = env.scene[asset_cfg.name]
+    ids = asset_cfg.joint_ids
+    err = asset.data.joint_pos[:, ids] - asset.data.default_joint_pos[:, ids]
+    return torch.sum(torch.square(err), dim=-1)
+
+
+def _self_collision_cost(env, sensor_name: str) -> torch.Tensor:
+    """Mirrors the sensor.data.found reduction idiom used throughout your
+    mdp.py (feet_grounded_reward, single_foot_grounded_reward): sum contact
+    'found' entries per env. Matches the self_collision sensor's own config
+    (fields=("found",), reduce="none") -- summing raw found counts is the
+    right reduction for a "none"-reduced sensor with potentially several
+    contact slots."""
+    if sensor_name not in env.scene.sensors:
+        return torch.zeros(env.num_envs, device=env.device)
+    found = env.scene.sensors[sensor_name].data.found
+    if found.dim() > 1:
+        found = found.sum(dim=-1)
+    return found.float()
+
+
+def _bad_orientation_termination(
+    env, limit_angle: float, asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
+    """Mirrors the exact tilt computation in your own _fallen_mask (cos_tilt
+    = 1 - 2*(qx^2+qy^2)); terminates when tilt exceeds limit_angle."""
+    asset = env.scene[asset_cfg.name]
+    quat = asset.data.root_link_quat_w
+    cos_tilt = 1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2)
+    return cos_tilt < math.cos(limit_angle)
 
 
 # ── Phase-Gating Helpers ──────────────────────────────────────────────────────
