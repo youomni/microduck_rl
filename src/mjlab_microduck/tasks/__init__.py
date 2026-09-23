@@ -248,8 +248,7 @@ register_mjlab_task(
 # ============================================================================
 # CUSTOM ADDITION (NOT UPSTREAM) — JUMP TASK REGISTRATION
 # Jump task — jump with targeted yaw rotation and clean landing balance.
-# Registers Mjlab-Jump-Flat-MicroDuck into the central task registry with training
-# and play configs.
+# Registers Mjlab-Jump-Flat-MicroDuck into the central task registry.
 # ============================================================================
 register_mjlab_task(
     task_id="Mjlab-Jump-Flat-MicroDuck",
@@ -292,12 +291,10 @@ _BACKLASH_TASKS = (
     ("Mjlab-SitStand-Flat-Backlash-MicroDuck", make_microduck_sitstand_env_cfg, {}, MicroduckSitStandRlCfg, _BL_GROUNDCONTACT),
     ("Mjlab-SitStand-Rough-Backlash-MicroDuck", make_microduck_sitstand_env_cfg, {"rough": True}, MicroduckSitStandRlCfg, _BL_GROUNDCONTACT),
     ("Mjlab-GroundPick-Flat-Backlash-MicroDuck", make_microduck_ground_pick_env_cfg, {}, MicroduckGroundPickRlCfg, _BL_GROUNDCONTACT),
-    ("Mjlab-GroundPick-Rough-Backlash-MicroDuck", make_microduck_ground_pick_env_cfg, {"rough": True}, MicroduckGroundPickRlCfg, _BL_GROUNDCONTACT),
+    ("Mjlab-GroundPick-Rough-Backlash-MicroDuck", make_microduck_ground_pick_env_cfg, {}, MicroduckGroundPickRlCfg, _BL_GROUNDCONTACT),
     ("Mjlab-BallKick-Flat-Backlash-MicroDuck", make_microduck_ball_kick_env_cfg, {}, MicroduckBallKickRlCfg, _BL_GROUNDCONTACT),
     # ============================================================================
     # CUSTOM ADDITION (NOT UPSTREAM) — JUMP BACKLASH VARIANT
-    # Registers Mjlab-Jump-Flat-Backlash-MicroDuck using the ground contact backlash
-    # robot variant, ensuring compatibility with hardware-in-the-loop gear tolerance simulations.
     # ============================================================================
     ("Mjlab-Jump-Flat-Backlash-MicroDuck", make_microduck_jump_env_cfg, {}, MicroduckJumpRlCfg, _BL_GROUNDCONTACT),
     # ============================================================================
